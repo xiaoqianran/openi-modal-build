@@ -44,22 +44,34 @@ CUDA 扩展均以 A100 `sm_80` 为目标构建。构建结束后，会在同一�
 
 FlexGEMM 的 `setup.py` 还会写入 `~/.flex_gemm/autotune_cache.json`。因为直接安装 wheel 不会再次执行这个 setup-time 行为，构建包会额外保存该 cache，并由 OpenI 安装脚本恢复。
 
-## 1. 创建 Modal GitHub Secret
+## 1. 准备 uv 和 Modal
+
+在仓库目录中创建 Python 3.12 虚拟环境，并安装带 API Proxy 支持的 Modal：
+
+```bash
+cd openi-TRELLIS.2
+uv venv --python 3.12
+uv add 'modal[api-proxy-support]'
+uv run modal token set
+```
+
+## 2. 创建 Modal GitHub Secret
 
 为 `xiaoqianran/openi-modal-build` 创建一个可写 Release 的 GitHub fine-grained token，然后：
 
 ```bash
-modal secret create github-openi-build GITHUB_TOKEN=你的_token
+uv run modal secret create github-openi-build GITHUB_TOKEN=你的_token
 ```
 
 不要把 token 写进仓库或脚本。
 
-## 2. 开始构建
+## 3. 开始构建
 
 在仓库根目录执行：
 
 ```bash
-modal run openi-TRELLIS.2/modal_build.py
+cd openi-TRELLIS.2
+uv run modal run modal_build.py
 ```
 
 Modal 会申请：
@@ -75,7 +87,7 @@ sm_80
 
 首次构建会比较慢，因为 `flash-attn / nvdiffrast / nvdiffrec / CuMesh / FlexGEMM / o-voxel` 都需要编译。
 
-## 3. GitHub Release 输出
+## 4. GitHub Release 输出
 
 构建成功后会创建或更新 Release：
 
@@ -103,7 +115,7 @@ flex_gemm_autotune_cache.json
 
 二进制放 GitHub Release，而不是直接提交到 Git 历史，避免大型 wheel 污染仓库。
 
-## 4. OpenI 安装
+## 5. OpenI 安装
 
 把 Release 中的 `trellis2-openi-cu124-torch260-py310-sm80.tar.gz` 上传到 OpenI，例如放在 `/tmp`：
 
@@ -131,7 +143,7 @@ Torch CUDA == 12.4
 
 然后安装普通 Python runtime 依赖，再以 `--no-deps` 安装已经构建好的 CUDA wheel，避免 pip 替换 OpenI 镜像自带的 PyTorch。
 
-## 5. 成功标志
+## 6. 成功标志
 
 最后应输出：
 
