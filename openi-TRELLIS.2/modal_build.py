@@ -6,6 +6,15 @@ APP_NAME = "openi-trellis2-wheel-builder"
 GITHUB_REPO = "xiaoqianran/openi-modal-build"
 RELEASE_TAG = "trellis2-cu124-torch2.6.0-py310-sm80"
 
+# Pin every Git source so rerunning a fixed Release tag cannot silently build a
+# different ABI or dependency set after an upstream branch moves.
+TRELLIS_REF = "75fbf0183001ed9876c8dbb35de6b68552ee08bd"
+UTILS3D_REF = "9a4eb15e4021b67b12c460c7057d642626897ec8"
+NVDIFFRAST_REF = "253ac4fcea7de5f396371124af597e6cc957bfae"
+NVDIFFREC_REF = "b296927cc7fd01c2ac1087c8065c4d7248f72da4"
+CUMESH_REF = "12289e1062f0603f2f0d0771b02e1395d247f26f"
+FLEXGEMM_REF = "6dd94a859c26ee8246888502eada3dd8ad85532e"
+
 # OpenI target:
 #   Ubuntu 22.04
 #   CUDA Toolkit 12.4.0
@@ -28,6 +37,7 @@ image = (
         "git",
         "git-lfs",
         "libjpeg-dev",
+        "zlib1g-dev",
         "ninja-build",
         "pkg-config",
     )
@@ -217,32 +227,103 @@ def build_and_release() -> dict[str, object]:
     trellis, sources["TRELLIS.2"] = clone(
         "TRELLIS.2",
         "https://github.com/microsoft/TRELLIS.2.git",
+        ref=TRELLIS_REF,
         recursive=True,
     )
     utils3d, sources["utils3d"] = clone(
         "utils3d",
         "https://github.com/EasternJournalist/utils3d.git",
-        ref="9a4eb15e4021b67b12c460c7057d642626897ec8",
+        ref=UTILS3D_REF,
     )
     nvdiffrast, sources["nvdiffrast"] = clone(
         "nvdiffrast",
         "https://github.com/NVlabs/nvdiffrast.git",
-        ref="v0.4.0",
+        ref=NVDIFFRAST_REF,
     )
     nvdiffrec, sources["nvdiffrec"] = clone(
         "nvdiffrec",
         "https://github.com/JeffreyXiang/nvdiffrec.git",
-        ref="renderutils",
+        ref=NVDIFFREC_REF,
     )
     cumesh, sources["CuMesh"] = clone(
         "CuMesh",
         "https://github.com/JeffreyXiang/CuMesh.git",
+        ref=CUMESH_REF,
         recursive=True,
     )
     flexgemm, sources["FlexGEMM"] = clone(
         "FlexGEMM",
         "https://github.com/JeffreyXiang/FlexGEMM.git",
+        ref=FLEXGEMM_REF,
         recursive=True,
+    )
+
+    # These are normal runtime dependencies. Keep them separate from the
+    # custom wheels so pip cannot replace the target image's torch build.
+    # Because the custom wheels are installed with --no-deps, this list also
+    # includes their non-torch dependencies that the upstream installers would
+    # otherwise resolve automatically.
+    basic_requirements = """\
+imageio
+imageio-ffmpeg
+tqdm
+easydict
+opencv-python-headless
+ninja
+trimesh
+# DINOv3ViTModel, imported by TRELLIS.2, was added in Transformers 4.56.
+transformers>=4.56.0,<6
+gradio==6.0.1
+tensorboard
+pandas
+lpips
+zstandard
+kornia
+timm
+torchvision==0.21.0
+numpy
+plyfile
+einops
+moderngl
+scipy
+filelock
+triton==3.2.0
+"""
+    requirements_path = dist / "requirements-openi.txt"
+    requirements_path.write_text(basic_requirements, encoding="utf-8")
+    constraints_path = dist / "constraints-openi.txt"
+    constraints_path.write_text(
+        "torch==2.6.0\ntorchvision==0.21.0\ntriton==3.2.0\n",
+        encoding="utf-8",
+    )
+
+    # Resolve runtime packages before the expensive CUDA builds. This both
+    # fails fast on dependency conflicts and makes the build environment match
+    # the environment used for validation and OpenI installation.
+    run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "-r",
+            str(requirements_path),
+            "-c",
+            str(constraints_path),
+        ]
+    )
+    run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import torch, torchvision, triton; "
+                "assert torch.__version__.split('+', 1)[0] == '2.6.0'; "
+                "assert torchvision.__version__.split('+', 1)[0] == '0.21.0'; "
+                "assert triton.__version__ == '3.2.0'; "
+                "print('constrained torch stack: OK')"
+            ),
+        ]
     )
 
     # Build the packages referenced by the official TRELLIS.2 setup.sh.
@@ -257,7 +338,7 @@ def build_and_release() -> dict[str, object]:
 
     # Official setup.sh installs pillow-simd from source; prebuild it too so
     # OpenI does not need a compiler for that step.
-    build_wheel("pillow-simd", "pillow-simd")
+    build_wheel("pillow-simd==9.5.0.post2", "pillow-simd==9.5.0.post2")
 
     wheel_files = sorted(wheels.glob("*.whl"))
     if not wheel_files:
@@ -270,8 +351,8 @@ def build_and_release() -> dict[str, object]:
     flex_cache_dst = dist / "flex_gemm_autotune_cache.json"
     shutil.copy2(flex_cache_src, flex_cache_dst)
 
-    # Install every wheel back into the same Modal A100 environment, then load
-    # the compiled extensions. This catches missing symbols/shared libraries.
+    # Install every freshly built wheel without dependency resolution, exactly
+    # as install_openi.sh will, then validate the resulting environment.
     run(
         [
             sys.executable,
@@ -283,47 +364,72 @@ def build_and_release() -> dict[str, object]:
             *[str(p) for p in wheel_files],
         ]
     )
+    run([sys.executable, "-m", "pip", "check"])
+
+    print("\n===== VERIFY RUNTIME DEPENDENCIES =====", flush=True)
     run(
         [
             sys.executable,
             "-c",
             (
-                "import flash_attn, flash_attn_2_cuda; "
-                "import nvdiffrast, _nvdiffrast_c; "
-                "import nvdiffrec_render, nvdiffrec_render.renderutils._C; "
-                "import cumesh, cumesh._C, cumesh._cubvh; "
-                "import o_voxel, o_voxel._C; "
-                "import flex_gemm, flex_gemm.kernels.cuda; "
-                "import utils3d; "
-                "print('compiled extension imports: OK')"
+                "import cv2, easydict, einops, filelock, gradio, imageio, "
+                "imageio_ffmpeg, kornia, lpips, moderngl, ninja, numpy, "
+                "pandas, plyfile, scipy, tensorboard, timm, tqdm, "
+                "transformers, trimesh, triton, torchvision, zstandard; "
+                "from transformers import DINOv3ViTModel; "
+                "print('runtime dependency imports: OK')"
             ),
         ]
     )
 
-    # These are normal runtime dependencies. OpenI can obtain them from PyPI
-    # without compiling the custom TRELLIS CUDA extensions.
-    basic_requirements = """\
-imageio
-imageio-ffmpeg
-tqdm
-easydict
-opencv-python-headless
-ninja
-trimesh
-transformers
-gradio==6.0.1
-tensorboard
-pandas
-lpips
-zstandard
-kornia
-timm
-numpy
-plyfile
-"""
-    (dist / "requirements-openi.txt").write_text(
-        basic_requirements,
-        encoding="utf-8",
+    extension_checks = [
+        ("flash-attn", "import flash_attn, flash_attn_2_cuda"),
+        ("nvdiffrast", "import nvdiffrast, _nvdiffrast_c"),
+        (
+            "nvdiffrec-render",
+            "import nvdiffrec_render, nvdiffrec_render.renderutils._C",
+        ),
+        (
+            "CuMesh",
+            "import cumesh, cumesh._C, cumesh._cubvh, "
+            "cumesh._cumesh_xatlas",
+        ),
+        ("o-voxel", "import o_voxel, o_voxel._C"),
+        ("FlexGEMM", "import flex_gemm, flex_gemm.kernels.cuda"),
+        (
+            "utils3d",
+            "import utils3d, utils3d.io, utils3d.numpy, utils3d.torch",
+        ),
+        (
+            "pillow-simd",
+            "from PIL import Image, features; "
+            "assert features.check('jpg'); assert features.check('zlib')",
+        ),
+    ]
+    for label, imports in extension_checks:
+        print(f"\n===== VERIFY {label} =====", flush=True)
+        run([sys.executable, "-c", f"{imports}; print('{label}: OK')"])
+
+    # Import the real TRELLIS.2 entry points from the pinned source tree. This
+    # catches integration-level missing dependencies that isolated wheel
+    # imports cannot see, while avoiding a model download or inference run.
+    print("\n===== VERIFY TRELLIS.2 INTEGRATION =====", flush=True)
+    run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from trellis2.pipelines import "
+                "Trellis2ImageTo3DPipeline, Trellis2TexturingPipeline; "
+                "from trellis2.renderers import "
+                "MeshRenderer, VoxelRenderer, PbrMeshRenderer; "
+                "from trellis2.models import "
+                "SparseStructureEncoder, SLatFlowModel, "
+                "FlexiDualGridVaeDecoder; "
+                "print('TRELLIS.2 integration imports: OK')"
+            ),
+        ],
+        cwd=trellis,
     )
 
     installer = """#!/bin/sh
@@ -342,11 +448,13 @@ assert torch.version.cuda == "12.4", "Expected Torch CUDA 12.4"
 PY
 
 # Normal Python dependencies first.
-python -m pip install -r "$HERE/requirements-openi.txt"
+python -m pip install \
+  -r "$HERE/requirements-openi.txt" \
+  -c "$HERE/constraints-openi.txt"
 
 # All GitHub/CUDA packages are already compiled. --no-deps is deliberate:
 # do not let pip replace the OpenI image's torch 2.6.0/cu124.
-python -m pip install --no-deps "$HERE"/wheelhouse/*.whl
+python -m pip install --no-deps --force-reinstall "$HERE"/wheelhouse/*.whl
 
 # Restore the FlexGEMM setup-time cache that a wheel install would otherwise
 # skip.
@@ -355,13 +463,26 @@ cp "$HERE/flex_gemm_autotune_cache.json" \
    "$HOME/.flex_gemm/autotune_cache.json"
 
 python - <<'PY'
+import torch, torchvision, triton
+assert torch.__version__.split("+", 1)[0] == "2.6.0", "Torch changed during install"
+assert torch.version.cuda == "12.4", "Torch CUDA changed during install"
+assert torchvision.__version__.split("+", 1)[0] == "0.21.0", "torchvision changed during install"
+assert triton.__version__ == "3.2.0", "Triton changed during install"
+
 import flash_attn, flash_attn_2_cuda
 import nvdiffrast, _nvdiffrast_c
 import nvdiffrec_render, nvdiffrec_render.renderutils._C
-import cumesh, cumesh._C, cumesh._cubvh
+import cumesh, cumesh._C, cumesh._cubvh, cumesh._cumesh_xatlas
 import o_voxel, o_voxel._C
 import flex_gemm, flex_gemm.kernels.cuda
-import utils3d
+import utils3d, utils3d.io, utils3d.numpy, utils3d.torch
+import cv2, easydict, einops, filelock, gradio, imageio, imageio_ffmpeg
+import kornia, lpips, moderngl, ninja, numpy, pandas, plyfile, scipy
+import tensorboard, timm, tqdm, transformers, trimesh, zstandard
+from transformers import DINOv3ViTModel
+from PIL import features
+assert features.check("jpg"), "pillow-simd was built without JPEG support"
+assert features.check("zlib"), "pillow-simd was built without zlib support"
 print("TRELLIS.2 prebuilt dependencies: OK")
 PY
 """
@@ -406,6 +527,7 @@ PY
     with tarfile.open(archive, "w:gz") as tf:
         tf.add(wheels, arcname="wheelhouse")
         tf.add(dist / "requirements-openi.txt", arcname="requirements-openi.txt")
+        tf.add(dist / "constraints-openi.txt", arcname="constraints-openi.txt")
         tf.add(installer_path, arcname="install_openi.sh")
         tf.add(manifest_path, arcname="manifest.json")
         tf.add(

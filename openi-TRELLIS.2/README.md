@@ -108,6 +108,7 @@ SHA256SUMS
 ```text
 wheelhouse/
 requirements-openi.txt
+constraints-openi.txt
 install_openi.sh
 manifest.json
 flex_gemm_autotune_cache.json
@@ -116,6 +117,8 @@ flex_gemm_autotune_cache.json
 二进制放 GitHub Release，而不是直接提交到 Git 历史，避免大型 wheel 污染仓库。
 
 ## 5. OpenI 安装
+
+这些 wheel 与 TRELLIS.2 commit `75fbf0183001ed9876c8dbb35de6b68552ee08bd` 对齐；OpenI 上的 TRELLIS.2 源码也应使用该 commit。
 
 把 Release 中的 `trellis2-openi-cu124-torch260-py310-sm80.tar.gz` 上传到 OpenI，例如放在 `/tmp`：
 
@@ -141,7 +144,7 @@ Torch == 2.6.0
 Torch CUDA == 12.4
 ```
 
-然后安装普通 Python runtime 依赖，再以 `--no-deps` 安装已经构建好的 CUDA wheel，避免 pip 替换 OpenI 镜像自带的 PyTorch。
+然后在 `constraints-openi.txt` 对 Torch、torchvision 和 Triton 的版本约束下安装普通 Python runtime 依赖，再以 `--no-deps --force-reinstall` 安装已经构建好的 CUDA wheel，避免 pip 替换 OpenI 镜像自带的 PyTorch，并确保同版本号的旧 wheel 不会被复用。
 
 ## 6. 成功标志
 
