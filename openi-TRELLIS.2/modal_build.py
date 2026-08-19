@@ -281,6 +281,7 @@ zstandard
 kornia
 timm
 torchvision==0.21.0
+pillow>=10.0.1,<13
 numpy
 plyfile
 einops
@@ -300,6 +301,19 @@ triton==3.2.0
     # Resolve runtime packages before the expensive CUDA builds. This both
     # fails fast on dependency conflicts and makes the build environment match
     # the environment used for validation and OpenI installation.
+    # Pillow and Pillow-SIMD install into the same PIL namespace. Remove both
+    # distributions first so stale SIMD files cannot mix with standard Pillow.
+    run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "uninstall",
+            "-y",
+            "pillow-simd",
+            "Pillow",
+        ]
+    )
     run(
         [
             sys.executable,
@@ -335,10 +349,6 @@ triton==3.2.0
     build_wheel(cumesh, "CuMesh")
     build_wheel(flexgemm, "FlexGEMM")
     build_wheel(trellis / "o-voxel", "TRELLIS.2/o-voxel")
-
-    # Official setup.sh installs pillow-simd from source; prebuild it too so
-    # OpenI does not need a compiler for that step.
-    build_wheel("pillow-simd==9.5.0.post2", "pillow-simd==9.5.0.post2")
 
     wheel_files = sorted(wheels.glob("*.whl"))
     if not wheel_files:
@@ -377,6 +387,10 @@ triton==3.2.0
                 "pandas, plyfile, scipy, tensorboard, timm, tqdm, "
                 "transformers, trimesh, triton, torchvision, zstandard; "
                 "from transformers import DINOv3ViTModel; "
+                "from PIL import Image, features; Image.init(); "
+                "assert features.check('jpg'); "
+                "assert features.check('zlib'); "
+                "assert features.check('webp'); "
                 "print('runtime dependency imports: OK')"
             ),
         ]
@@ -399,11 +413,6 @@ triton==3.2.0
         (
             "utils3d",
             "import utils3d, utils3d.io, utils3d.numpy, utils3d.torch",
-        ),
-        (
-            "pillow-simd",
-            "from PIL import Image, features; "
-            "assert features.check('jpg'); assert features.check('zlib')",
         ),
     ]
     for label, imports in extension_checks:
@@ -447,6 +456,10 @@ assert torch.__version__.split("+", 1)[0] == "2.6.0", "Expected Torch 2.6.0"
 assert torch.version.cuda == "12.4", "Expected Torch CUDA 12.4"
 PY
 
+# Pillow-SIMD and Pillow share the PIL namespace but have different package
+# metadata. Remove both before installing the supported standard Pillow wheel.
+python -m pip uninstall -y pillow-simd Pillow
+
 # Normal Python dependencies first.
 python -m pip install \
   -r "$HERE/requirements-openi.txt" \
@@ -480,9 +493,11 @@ import cv2, easydict, einops, filelock, gradio, imageio, imageio_ffmpeg
 import kornia, lpips, moderngl, ninja, numpy, pandas, plyfile, scipy
 import tensorboard, timm, tqdm, transformers, trimesh, zstandard
 from transformers import DINOv3ViTModel
-from PIL import features
-assert features.check("jpg"), "pillow-simd was built without JPEG support"
-assert features.check("zlib"), "pillow-simd was built without zlib support"
+from PIL import Image, features
+Image.init()
+assert features.check("jpg"), "Pillow has no JPEG support"
+assert features.check("zlib"), "Pillow has no zlib support"
+assert features.check("webp"), "Pillow has no WebP support"
 print("TRELLIS.2 prebuilt dependencies: OK")
 PY
 """

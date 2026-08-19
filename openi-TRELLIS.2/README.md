@@ -38,9 +38,10 @@ nvidia/cuda:12.4.0-devel-ubuntu22.04
 - `CuMesh`
 - `FlexGEMM`
 - `TRELLIS.2/o-voxel`
-- `pillow-simd`
 
 CUDA 扩展均以 A100 `sm_80` 为目标构建。构建结束后，会在同一个 Modal A100 环境中重新安装这些 wheel，并加载编译扩展进行验证。
+
+官方脚本中的 `pillow-simd` 与标准 `Pillow` 共用 `PIL` 命名空间，和 Gradio 6 所需的现代 Pillow 混装会造成 Python 文件与 `_webp` 扩展版本不一致。安装包因此统一使用 `Pillow>=10.0.1,<13`，并在安装前清理两种 Pillow 发行包，避免残留文件污染。
 
 FlexGEMM 的 `setup.py` 还会写入 `~/.flex_gemm/autotune_cache.json`。因为直接安装 wheel 不会再次执行这个 setup-time 行为，构建包会额外保存该 cache，并由 OpenI 安装脚本恢复。
 
