@@ -46,6 +46,13 @@ image = (
     )
     .env(
         {
+            # Modal's standalone Python is built with Clang and its sysconfig
+            # therefore defaults C++ extension linking to clang++. The CUDA
+            # image only provides GCC via build-essential, and PyTorch's Linux
+            # wheels are built with GCC, so force one consistent toolchain.
+            "CC": "/usr/bin/gcc",
+            "CXX": "/usr/bin/g++",
+            "CUDAHOSTCXX": "/usr/bin/g++",
             "CUDA_HOME": "/usr/local/cuda",
             "BUILD_TARGET": "cuda",
             "TORCH_CUDA_ARCH_LIST": "8.0",
@@ -102,6 +109,9 @@ def build_and_release() -> dict[str, object]:
     env = os.environ.copy()
     env.update(
         {
+            "CC": "/usr/bin/gcc",
+            "CXX": "/usr/bin/g++",
+            "CUDAHOSTCXX": "/usr/bin/g++",
             "CUDA_HOME": "/usr/local/cuda",
             "BUILD_TARGET": "cuda",
             "TORCH_CUDA_ARCH_LIST": "8.0",
@@ -182,6 +192,10 @@ def build_and_release() -> dict[str, object]:
     print("CUDA available:", torch.cuda.is_available())
     print("GPU:", torch.cuda.get_device_name(0))
     print("Capability:", torch.cuda.get_device_capability(0))
+    print("CC:", env["CC"])
+    print("CXX:", env["CXX"])
+    print("CUDAHOSTCXX:", env["CUDAHOSTCXX"])
+    run([env["CXX"], "--version"])
     run(["nvcc", "--version"])
 
     if sys.version_info[:2] != (3, 10):
