@@ -167,7 +167,7 @@ def _cache_key() -> str:
     gpu="A100-40GB",
     cpu=16.0,
     memory=32768,
-    ephemeral_disk=100 * 1024,
+    ephemeral_disk=512 * 1024,
     timeout=3 * 60 * 60,
     volumes={"/cache": build_cache},
 )
@@ -485,7 +485,7 @@ def build_wheelhouse(force_rebuild: bool = False) -> dict[str, object]:
     gpu="A100-40GB",
     cpu=8.0,
     memory=24576,
-    ephemeral_disk=50 * 1024,
+    ephemeral_disk=512 * 1024,
     timeout=60 * 60,
     volumes={"/cache": build_cache},
 )
