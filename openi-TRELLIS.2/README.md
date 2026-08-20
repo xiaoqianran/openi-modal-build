@@ -1,31 +1,36 @@
 # OpenI TRELLIS.2 预编译 Wheel 构建
 
-目标环境：
+本仓库为 OpenI 的两个 Python 运行时分别构建并验证 TRELLIS.2 所需的预编译 wheel：
 
-- OpenI 镜像：`ubuntu22.04-cuda12.4.0-py310-torch2.6.0`
+| Python | 构建脚本 | OpenI 目标镜像 | Release tag | Release 压缩包 |
+| --- | --- | --- | --- | --- |
+| 3.10 | `modal_build_py310.py` | `ubuntu22.04-cuda12.4.0-py310-torch2.6.0` | `trellis2-cu124-torch2.6.0-py310-sm80` | `trellis2-openi-cu124-torch260-py310-sm80.tar.gz` |
+| 3.11 | `modal_build_py311.py` | `ubuntu22.04-cuda12.4.0-py311-torch2.6.0` | `trellis2-cu124-torch2.6.0-py311-sm80` | `trellis2-openi-cu124-torch260-py311-sm80.tar.gz` |
+
+两个版本均使用：
+
 - Ubuntu 22.04
-- Python 3.10
 - CUDA Toolkit 12.4.0
 - PyTorch 2.6.0 + cu124
-- NVIDIA A100 40GB / sm_80
+- NVIDIA A100 40GB / `sm_80`
 
-`modal_build.py` 会在 Modal 的 `A100-40GB` 上构建并验证 TRELLIS.2 需要的预编译 wheel，然后自动发布到本仓库的 GitHub Release。
+构建脚本会在 Modal 的 `A100-40GB` 上编译并验证 wheel，然后自动发布到本仓库的 GitHub Release。Python 3.10 和 3.11 的 wheel、缓存和 Release 相互隔离，不能混用。
 
 ## 为什么不用 OpenI 的原始镜像
 
-OpenI 镜像地址：
+OpenI 的 Python 3.10 镜像地址为：
 
 ```text
 192.168.192.180:1443/default-workspace/2a72307689ae49758c80c896fffda0a1/image:ubuntu22.04-cuda12.4.0-py310-torch2.6.0
 ```
 
-这是私有网段地址，Modal 无法假定能够直接访问，因此构建脚本使用公开的：
+这是私有网段地址，Modal 无法假定能够直接访问。Python 3.11 的脚本也只把对应镜像名作为目标 ABI 标签，Modal 同样使用公开的：
 
 ```text
 nvidia/cuda:12.4.0-devel-ubuntu22.04
 ```
 
-再安装 Python 3.10、PyTorch 2.6.0/cu124，并固定 `TORCH_CUDA_ARCH_LIST=8.0`，尽量匹配 OpenI 的 ABI、CUDA 和 GPU 架构。
+然后分别安装 Python 3.10 或 3.11、PyTorch 2.6.0/cu124，并固定 `TORCH_CUDA_ARCH_LIST=8.0`，尽量匹配 OpenI 的 ABI、CUDA 和 GPU 架构。
 
 ## 构建内容
 
@@ -68,20 +73,30 @@ uv run modal secret create github-openi-build GITHUB_TOKEN=你的_token
 
 ## 3. 开始构建
 
-在仓库根目录执行：
+在仓库根目录执行对应版本的命令：
 
 ```bash
-cd openi-TRELLIS.2
-uv run modal run modal_build.py
+# Python 3.10
+uv run modal run modal_build_py310.py
+
+# Python 3.11
+uv run modal run modal_build_py311.py
 ```
 
-Modal 会申请：
+也可以先只构建和验证、不发布 GitHub Release：
+
+```bash
+uv run modal run modal_build_py310.py --no-publish
+uv run modal run modal_build_py311.py --no-publish
+```
+
+每个脚本对应的 Modal 构建环境为：
 
 ```text
 A100-40GB
 Ubuntu 22.04
 CUDA 12.4.0 devel
-Python 3.10
+Python 3.10 或 3.11
 PyTorch 2.6.0 + cu124
 sm_80
 ```
@@ -90,16 +105,19 @@ sm_80
 
 ## 4. GitHub Release 输出
 
-构建成功后会创建或更新 Release：
+构建成功后会创建或更新对应的 Release：
 
 ```text
 trellis2-cu124-torch2.6.0-py310-sm80
+trellis2-cu124-torch2.6.0-py311-sm80
 ```
 
-Release 中包含：
+每个 Release 包含对应 Python 版本的：
 
 ```text
 trellis2-openi-cu124-torch260-py310-sm80.tar.gz
+或
+trellis2-openi-cu124-torch260-py311-sm80.tar.gz
 manifest.json
 SHA256SUMS
 ```
@@ -121,26 +139,32 @@ flex_gemm_autotune_cache.json
 
 这些 wheel 与 TRELLIS.2 commit `75fbf0183001ed9876c8dbb35de6b68552ee08bd` 对齐；OpenI 上的 TRELLIS.2 源码也应使用该 commit。
 
-把 Release 中的 `trellis2-openi-cu124-torch260-py310-sm80.tar.gz` 上传到 OpenI，例如放在 `/tmp`：
+根据 OpenI 的 Python 版本，从对应 Release 下载压缩包并上传到 OpenI。例如：
+
+```sh
+# Python 3.10
+ARCHIVE=trellis2-openi-cu124-torch260-py310-sm80.tar.gz
+```
+
+```sh
+# Python 3.11
+ARCHIVE=trellis2-openi-cu124-torch260-py311-sm80.tar.gz
+```
+
+然后执行：
 
 ```sh
 mkdir -p /tmp/trellis2-prebuilt
-```
-
-```sh
-tar -xzf /tmp/trellis2-openi-cu124-torch260-py310-sm80.tar.gz -C /tmp/trellis2-prebuilt
-```
-
-```sh
+tar -xzf "/tmp/$ARCHIVE" -C /tmp/trellis2-prebuilt
 sh /tmp/trellis2-prebuilt/install_openi.sh
 ```
 
 这个阶段不会重新编译 TRELLIS.2 的 CUDA 扩展，核心 wheel 直接安装。
 
-安装脚本会先检查：
+安装脚本会先检查对应的 Python 版本，以及：
 
 ```text
-Python == 3.10
+Python == 3.10 或 3.11
 Torch == 2.6.0
 Torch CUDA == 12.4
 ```
@@ -155,7 +179,7 @@ Torch CUDA == 12.4
 TRELLIS.2 prebuilt dependencies: OK
 ```
 
-之后即可在 OpenI 的 TRELLIS.2 仓库目录中直接加载：
+之后即可在对应 Python 版本的 OpenI TRELLIS.2 仓库目录中直接加载：
 
 ```text
 /tmp/pretrainmodel/TRELLIS.2-4B

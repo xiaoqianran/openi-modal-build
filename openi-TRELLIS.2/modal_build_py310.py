@@ -6,8 +6,15 @@ APP_NAME = "openi-trellis2-wheel-builder"
 GITHUB_REPO = "xiaoqianran/openi-modal-build"
 RELEASE_TAG = "trellis2-cu124-torch2.6.0-py310-sm80"
 CACHE_VOLUME_NAME = "openi-trellis2-wheel-cache"
-CACHE_SCHEMA = "v3"
+CACHE_SCHEMA = "v4-003"
 UV_VERSION = "0.12.3"
+MODAL_GPU = "A100-40GB"
+RELEASE_ARCHIVE = "trellis2-openi-cu124-torch260-py310-sm80.tar.gz"
+OPENI_IMAGE_REFERENCE = (
+    "192.168.192.180:1443/default-workspace/"
+    "2a72307689ae49758c80c896fffda0a1/"
+    "image:ubuntu22.04-cuda12.4.0-py310-torch2.6.0"
+)
 
 # Target ABI/runtime: OpenI ubuntu22.04-cuda12.4.0-py310-torch2.6.0 + A100/sm_80.
 PYTHON_MINOR = "3.10"
@@ -40,30 +47,33 @@ SOURCE_SPECS = {
 # Keep torch/torchvision/triton constrained so dependency resolution cannot replace
 # the OpenI base image's CUDA stack. Transformers stays on the 4.x line because
 # TRELLIS.2 needs DINOv3ViTModel but there is no reason to absorb a future major API.
+# Direct runtime versions below are the exact versions observed in the final
+# successful Modal validation run. Pinning them prevents a future PyPI resolver
+# run from silently changing the OpenI environment under the same release tag.
 RUNTIME_REQUIREMENTS = """\
-imageio
-imageio-ffmpeg
-tqdm
-easydict
-opencv-python-headless
-ninja
-trimesh
-transformers>=4.56.0,<5
+imageio==2.37.4
+imageio-ffmpeg==0.6.0
+tqdm==4.70.0
+easydict==1.13
+opencv-python-headless==5.0.0.93
+ninja==1.13.0
+trimesh==5.0.0
+transformers==4.57.6
 gradio==6.0.1
-tensorboard
-pandas
-lpips
-zstandard
-kornia
-timm
+tensorboard==2.21.0
+pandas==2.3.3
+lpips==0.1.4
+zstandard==0.25.0
+kornia==0.8.2
+timm==1.0.28
 torchvision==0.21.0
-pillow>=10.0.1,<13
-numpy
-plyfile
-einops
-moderngl
-scipy
-filelock
+pillow==12.3.0
+numpy==2.2.6
+plyfile==1.1.5
+einops==0.8.2
+moderngl==5.12.0
+scipy==1.15.3
+filelock==3.32.3
 triton==3.2.0
 """
 
@@ -164,11 +174,12 @@ def _cache_key() -> str:
 
 @app.function(
     image=build_image,
-    gpu="A100-40GB",
+    gpu=MODAL_GPU,
     cpu=16.0,
     memory=32768,
-    ephemeral_disk=512 * 1024,
     timeout=3 * 60 * 60,
+    max_containers=1,
+    retries=1,
     volumes={"/cache": build_cache},
 )
 def build_wheelhouse(force_rebuild: bool = False) -> dict[str, object]:
@@ -243,7 +254,11 @@ def build_wheelhouse(force_rebuild: bool = False) -> dict[str, object]:
         try:
             with zipfile.ZipFile(path) as zf:
                 names = zf.namelist()
-                return bool(names) and any(n.endswith(".dist-info/WHEEL") for n in names)
+                return (
+                    bool(names)
+                    and any(n.endswith(".dist-info/WHEEL") for n in names)
+                    and zf.testzip() is None
+                )
         except (OSError, zipfile.BadZipFile):
             return False
 
@@ -254,7 +269,7 @@ def build_wheelhouse(force_rebuild: bool = False) -> dict[str, object]:
         # This avoids cloning submodules for a moving default branch only to
         # immediately replace them after checkout.
         run(["git", "clone", url, str(dst)])
-        run(["git", "checkout", ref], cwd=dst)
+        run(["git", "-c", "advice.detachedHead=false", "checkout", "--detach", ref], cwd=dst)
         if recursive:
             run(["git", "submodule", "update", "--init", "--recursive"], cwd=dst)
         sha = run(["git", "rev-parse", "HEAD"], cwd=dst, capture=True)
@@ -382,7 +397,20 @@ def build_wheelhouse(force_rebuild: bool = False) -> dict[str, object]:
         cached_flat = sorted(flat_cache.glob("*.whl"))
         if len(cached_flat) >= 7 and all(valid_wheel(p) for p in cached_flat):
             metadata = json.loads(cache_meta.read_text(encoding="utf-8"))
-            if metadata.get("cache_key") == key:
+            expected_wheels = {
+                item["name"]: (item.get("size"), item.get("sha256"))
+                for item in metadata.get("wheels", [])
+                if isinstance(item, dict) and item.get("name")
+            }
+            actual_names = {p.name for p in cached_flat}
+            hashes_match = bool(expected_wheels) and actual_names == set(expected_wheels)
+            if hashes_match:
+                for wheel in cached_flat:
+                    expected_size, expected_sha = expected_wheels[wheel.name]
+                    if wheel.stat().st_size != expected_size or sha256_file(wheel) != expected_sha:
+                        hashes_match = False
+                        break
+            if metadata.get("cache_key") == key and hashes_match:
                 print(f"===== COMPLETE WHEELHOUSE CACHE HIT {key} =====", flush=True)
                 return {
                     "cache_key": key,
@@ -391,6 +419,7 @@ def build_wheelhouse(force_rebuild: bool = False) -> dict[str, object]:
                     "cache_hit_allowed": True,
                     "complete_cache_hit": True,
                 }
+            print("===== COMPLETE CACHE REJECTED: metadata/hash mismatch =====", flush=True)
 
     # o-voxel declares several Python packages as build requirements. With
     # --no-build-isolation those requirements must already exist in the build
@@ -456,6 +485,7 @@ def build_wheelhouse(force_rebuild: bool = False) -> dict[str, object]:
             "torch": torch.__version__,
             "torch_cuda": torch.version.cuda,
             "gpu": torch.cuda.get_device_name(0),
+            "gpu_memory_bytes": torch.cuda.get_device_properties(0).total_memory,
             "compute_capability": list(torch.cuda.get_device_capability(0)),
             "uv": run(["uv", "--version"], capture=True),
             "gcc": run([env["CXX"], "-dumpfullversion"], capture=True),
@@ -482,11 +512,12 @@ def build_wheelhouse(force_rebuild: bool = False) -> dict[str, object]:
 
 @app.function(
     image=build_image,
-    gpu="A100-40GB",
+    gpu=MODAL_GPU,
     cpu=8.0,
     memory=24576,
-    ephemeral_disk=512 * 1024,
     timeout=60 * 60,
+    max_containers=1,
+    retries=1,
     volumes={"/cache": build_cache},
 )
 def validate_and_package(cache_key: str) -> dict[str, object]:
@@ -538,6 +569,9 @@ def validate_and_package(cache_key: str) -> dict[str, object]:
             with zipfile.ZipFile(wheel) as zf:
                 if not any(n.endswith(".dist-info/WHEEL") for n in zf.namelist()):
                     raise RuntimeError(f"Malformed wheel: {wheel}")
+                bad_member = zf.testzip()
+                if bad_member is not None:
+                    raise RuntimeError(f"Wheel CRC failure: {wheel.name}: {bad_member}")
         except zipfile.BadZipFile as exc:
             raise RuntimeError(f"Corrupt wheel: {wheel}") from exc
 
@@ -549,6 +583,9 @@ def validate_and_package(cache_key: str) -> dict[str, object]:
             "TORCH_CUDA_ARCH_LIST": CUDA_ARCH,
             "UV_CACHE_DIR": "/tmp/uv-cache",
             "UV_LINK_MODE": "copy",
+            # Critical OpenI invariant: validation is not allowed to hide a missing
+            # wheel by compiling an sdist. If a binary is unavailable, fail here.
+            "UV_NO_BUILD": "1",
             "LD_LIBRARY_PATH": (
                 f"{torch_lib}:/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs:"
                 + env.get("LD_LIBRARY_PATH", "")
@@ -601,6 +638,7 @@ def validate_and_package(cache_key: str) -> dict[str, object]:
 
     requirements_path = dist / "requirements-openi.txt"
     constraints_path = dist / "constraints-openi.txt"
+    resolved_constraints_path = dist / "constraints-openi.resolved.txt"
     requirements_path.write_text(RUNTIME_REQUIREMENTS, encoding="utf-8")
     constraints_path.write_text(RUNTIME_CONSTRAINTS, encoding="utf-8")
 
@@ -618,6 +656,26 @@ def validate_and_package(cache_key: str) -> dict[str, object]:
             "-c",
             str(constraints_path),
         ]
+    )
+
+    # Freeze the successfully-resolved registry environment. This file is shipped
+    # as an additional constraints layer, so OpenI resolves to the exact transitive
+    # versions that were validated here rather than whatever PyPI serves later.
+    resolved_lines = []
+    for line in run(["uv", "pip", "freeze", "--python", sys.executable], capture=True).splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        normalized = stripped.split("==", 1)[0].lower().replace("_", "-")
+        # The target image owns this CUDA-sensitive stack; keep those constraints
+        # in the small hand-written file so local-version suffixes such as +cu124
+        # cannot make the resolved file unnecessarily brittle.
+        if normalized in {"torch", "torchvision", "triton"}:
+            continue
+        resolved_lines.append(stripped)
+    resolved_constraints_path.write_text(
+        "\n".join(sorted(set(resolved_lines), key=str.lower)) + "\n",
+        encoding="utf-8",
     )
 
     # Install the exact wheelhouse without dependency resolution. --reinstall makes
@@ -716,7 +774,7 @@ def validate_and_package(cache_key: str) -> dict[str, object]:
 
     # Import the exact TRELLIS.2 source revision against the prebuilt wheelhouse.
     run(["git", "clone", SOURCE_SPECS["TRELLIS.2"][0], str(trellis)])
-    run(["git", "checkout", TRELLIS_REF], cwd=trellis)
+    run(["git", "-c", "advice.detachedHead=false", "checkout", "--detach", TRELLIS_REF], cwd=trellis)
     run(["git", "submodule", "update", "--init", "--recursive"], cwd=trellis)
     actual_trellis = run(["git", "rev-parse", "HEAD"], cwd=trellis, capture=True)
     if actual_trellis != TRELLIS_REF:
@@ -758,13 +816,17 @@ set -eu
 HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 
 python - <<'PY_CHECK'
-import sys, torch
+import sys, torch, torchvision, triton
 print("Python:", sys.version)
 print("Torch:", torch.__version__)
 print("Torch CUDA:", torch.version.cuda)
+print("Torchvision:", torchvision.__version__)
+print("Triton:", triton.__version__)
 assert sys.version_info[:2] == (3, 10), "Expected Python 3.10"
 assert torch.__version__.split("+", 1)[0] == "{TORCH_VERSION}", "Expected Torch {TORCH_VERSION}"
 assert torch.version.cuda == "{TORCH_CUDA_VERSION}", "Expected Torch CUDA {TORCH_CUDA_VERSION}"
+assert torchvision.__version__.split("+", 1)[0] == "{TORCHVISION_VERSION}", "Expected Torchvision {TORCHVISION_VERSION}"
+assert triton.__version__ == "3.2.0", "Expected Triton 3.2.0"
 PY_CHECK
 
 if ! command -v uv >/dev/null 2>&1; then
@@ -772,12 +834,22 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 export UV_LINK_MODE=copy
+# Never compile on OpenI. A missing binary wheel must fail loudly instead of
+# consuming GPU job time building CUDA/C++ extensions again.
+export UV_NO_BUILD=1
 PYTHON_BIN="$(command -v python)"
+
+if command -v sha256sum >/dev/null 2>&1 && [ -f "$HERE/SHA256SUMS.contents" ]; then
+  (cd "$HERE" && sha256sum -c SHA256SUMS.contents)
+fi
+
 uv pip uninstall --python "$PYTHON_BIN" pillow-simd Pillow >/dev/null 2>&1 || true
 uv pip install --python "$PYTHON_BIN" \
   -r "$HERE/requirements-openi.txt" \
-  -c "$HERE/constraints-openi.txt"
+  -c "$HERE/constraints-openi.txt" \
+  -c "$HERE/constraints-openi.resolved.txt"
 uv pip install --python "$PYTHON_BIN" --no-deps --reinstall "$HERE"/wheelhouse/*.whl
+uv pip check --python "$PYTHON_BIN"
 
 mkdir -p "$HOME/.flex_gemm"
 cp "$HERE/flex_gemm_autotune_cache.json" "$HOME/.flex_gemm/autotune_cache.json"
@@ -815,17 +887,13 @@ PY_VERIFY
         "release_tag": RELEASE_TAG,
         "cache_key": cache_key,
         "target": {
-            "openi_image_reference": (
-                "192.168.192.180:1443/default-workspace/"
-                "2a72307689ae49758c80c896fffda0a1/"
-                "image:ubuntu22.04-cuda12.4.0-py310-torch2.6.0"
-            ),
+            "openi_image_reference": OPENI_IMAGE_REFERENCE,
             "os": "Ubuntu 22.04",
             "python": PYTHON_MINOR,
             "cuda_toolkit": CUDA_TOOLKIT_VERSION,
             "torch": TORCH_VERSION,
             "torch_cuda": TORCH_CUDA_VERSION,
-            "gpu": "NVIDIA A100 40GB",
+            "gpu": "NVIDIA A100 40GB target",
             "compute_capability": CUDA_ARCH,
         },
         "build": build_metadata,
@@ -835,30 +903,58 @@ PY_VERIFY
             "torch": torch.__version__,
             "torch_cuda": torch.version.cuda,
             "gpu": torch.cuda.get_device_name(0),
+            "gpu_memory_bytes": torch.cuda.get_device_properties(0).total_memory,
             "compute_capability": list(torch.cuda.get_device_capability(0)),
             "uv": run(["uv", "--version"], capture=True),
             "trellis_ref": actual_trellis,
             "nvdiffrast_cuda_smoke": True,
             "uv_bootstrap_wheel": uv_bootstrap[0].name,
+            "resolved_constraints_sha256": sha256_file(resolved_constraints_path),
+            "source_builds_disabled": True,
         },
         "created_unix": int(time.time()),
     }
     manifest_path = dist / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    archive = dist / "trellis2-openi-cu124-torch260-py310-sm80.tar.gz"
+    archive = dist / RELEASE_ARCHIVE
+    # Hash every payload inside the archive as well as the archive itself. OpenI's
+    # installer verifies SHA256SUMS.contents before touching the environment.
+    content_sums = dist / "SHA256SUMS.contents"
+    content_entries = []
+    content_entries.extend((p, f"wheelhouse/{p.name}") for p in wheel_files)
+    content_entries.extend((p, f"bootstrap/{p.name}") for p in sorted(bootstrap.glob("*.whl")))
+    content_entries.extend(
+        [
+            (requirements_path, "requirements-openi.txt"),
+            (constraints_path, "constraints-openi.txt"),
+            (resolved_constraints_path, "constraints-openi.resolved.txt"),
+            (installer_path, "install_openi.sh"),
+            (manifest_path, "manifest.json"),
+            (dist / "flex_gemm_autotune_cache.json", "flex_gemm_autotune_cache.json"),
+        ]
+    )
+    content_sums.write_text(
+        "\n".join(f"{sha256_file(path)}  {rel}" for path, rel in content_entries) + "\n",
+        encoding="utf-8",
+    )
+
     with tarfile.open(archive, "w:gz") as tf:
         tf.add(wheels, arcname="wheelhouse")
         tf.add(bootstrap, arcname="bootstrap")
         tf.add(requirements_path, arcname="requirements-openi.txt")
         tf.add(constraints_path, arcname="constraints-openi.txt")
+        tf.add(resolved_constraints_path, arcname="constraints-openi.resolved.txt")
         tf.add(installer_path, arcname="install_openi.sh")
         tf.add(manifest_path, arcname="manifest.json")
+        tf.add(content_sums, arcname="SHA256SUMS.contents")
         tf.add(dist / "flex_gemm_autotune_cache.json", arcname="flex_gemm_autotune_cache.json")
 
     sums = dist / "SHA256SUMS"
-    sum_lines = [f"{sha256_file(archive)}  {archive.name}"]
-    sum_lines.extend(f"{sha256_file(p)}  wheelhouse/{p.name}" for p in wheel_files)
+    sum_lines = [
+        f"{sha256_file(archive)}  {archive.name}",
+        f"{sha256_file(manifest_path)}  {manifest_path.name}",
+    ]
     sums.write_text("\n".join(sum_lines) + "\n", encoding="utf-8")
 
     release_cache = cache_root / "release"
@@ -885,6 +981,8 @@ PY_VERIFY
     cpu=1.0,
     memory=1024,
     timeout=30 * 60,
+    max_containers=1,
+    retries=1,
     volumes={"/cache": build_cache},
     secrets=[github_secret],
 )
@@ -901,7 +999,7 @@ def publish_release(cache_key: str) -> dict[str, object]:
 
     build_cache.reload()
     release_dir = pathlib.Path("/cache/trellis2") / cache_key / "release"
-    archive = release_dir / "trellis2-openi-cu124-torch260-py310-sm80.tar.gz"
+    archive = release_dir / RELEASE_ARCHIVE
     manifest = release_dir / "manifest.json"
     sums = release_dir / "SHA256SUMS"
     for path in (archive, manifest, sums):
