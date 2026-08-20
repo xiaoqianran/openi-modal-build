@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import modal
 
-APP_NAME = "openi-trellis2-wheel-builder-py311"
+APP_NAME = "v2-openi-trellis2-wheel-builder-py311"
 GITHUB_REPO = "xiaoqianran/openi-modal-build"
-RELEASE_TAG = "trellis2-cu124-torch2.6.0-py311-sm80"
+RELEASE_TAG = "v2-trellis2-cu124-torch2.6.0-py311-sm80"
 CACHE_VOLUME_NAME = "openi-trellis2-wheel-cache-py311"
 CACHE_SCHEMA = "v4-003-py311"
 UV_VERSION = "0.12.3"
 MODAL_GPU = "A100-40GB"
-RELEASE_ARCHIVE = "trellis2-openi-cu124-torch260-py311-sm80.tar.gz"
+RELEASE_ARCHIVE = "v2-trellis2-openi-cu124-torch260-py311-sm80.tar.gz"
 # The py310 private OpenI registry image ID is intentionally not reused here.
 # This value is a target ABI label for the manifest; the installer enforces Python 3.11 at runtime.
 OPENI_IMAGE_REFERENCE = (
@@ -245,9 +245,11 @@ def build_wheelhouse(force_rebuild: bool = False) -> dict[str, object]:
             env=env,
             text=True,
             stdout=subprocess.PIPE if capture else None,
-            stderr=subprocess.STDOUT if capture else None,
+            stderr=subprocess.PIPE if capture else None,
             check=check,
         )
+        if capture and proc.stderr:
+            print(proc.stderr, file=sys.stderr, end="" if proc.stderr.endswith("\n") else "\n", flush=True)
         return proc.stdout.strip() if capture and proc.stdout else ""
 
     def valid_wheel(path: pathlib.Path) -> bool:
@@ -613,9 +615,11 @@ def validate_and_package(cache_key: str) -> dict[str, object]:
             env=env,
             text=True,
             stdout=subprocess.PIPE if capture else None,
-            stderr=subprocess.STDOUT if capture else None,
+            stderr=subprocess.PIPE if capture else None,
             check=check,
         )
+        if capture and proc.stderr:
+            print(proc.stderr, file=sys.stderr, end="" if proc.stderr.endswith("\n") else "\n", flush=True)
         return proc.stdout.strip() if capture and proc.stdout else ""
 
     def sha256_file(path: pathlib.Path) -> str:
@@ -664,25 +668,55 @@ def validate_and_package(cache_key: str) -> dict[str, object]:
         ]
     )
 
-    # Freeze the successfully-resolved registry environment. This file is shipped
-    # as an additional constraints layer, so OpenI resolves to the exact transitive
-    # versions that were validated here rather than whatever PyPI serves later.
-    resolved_lines = []
+    # Keep a diagnostic snapshot of the exact registry environment validated on Modal.
+    # IMPORTANT: this file is NOT consumed by install_openi.sh. It is metadata only.
+    # `uv` writes status messages such as "Using Python ..." to stderr, so run() keeps
+    # stderr separate. Parse every stdout line as a PEP 508 requirement as a second
+    # guard against future uv output-format changes or accidental log contamination.
+    from packaging.requirements import InvalidRequirement, Requirement
+    from packaging.utils import canonicalize_name
+
+    resolved_lines: list[str] = []
+    rejected_freeze_lines: list[str] = []
     for line in run(["uv", "pip", "freeze", "--python", sys.executable], capture=True).splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        normalized = stripped.split("==", 1)[0].lower().replace("_", "-")
-        # The target image owns this CUDA-sensitive stack; keep those constraints
-        # in the small hand-written file so local-version suffixes such as +cu124
-        # cannot make the resolved file unnecessarily brittle.
+        try:
+            req = Requirement(stripped)
+        except InvalidRequirement:
+            rejected_freeze_lines.append(stripped)
+            continue
+        normalized = canonicalize_name(req.name)
+        # The OpenI image owns the CUDA-sensitive torch stack.
         if normalized in {"torch", "torchvision", "triton"}:
             continue
         resolved_lines.append(stripped)
+
+    if rejected_freeze_lines:
+        print(
+            "WARNING: ignored non-requirement lines from `uv pip freeze`: "
+            + repr(rejected_freeze_lines),
+            file=sys.stderr,
+            flush=True,
+        )
+    if not resolved_lines:
+        raise RuntimeError("uv pip freeze produced no valid resolved requirements")
+
     resolved_constraints_path.write_text(
         "\n".join(sorted(set(resolved_lines), key=str.lower)) + "\n",
         encoding="utf-8",
     )
+
+    # Fail packaging immediately if the diagnostic snapshot itself is malformed.
+    # This catches regressions during Modal validation, before anything reaches OpenI.
+    for line_no, line in enumerate(resolved_constraints_path.read_text(encoding="utf-8").splitlines(), 1):
+        try:
+            Requirement(line)
+        except InvalidRequirement as exc:
+            raise RuntimeError(
+                f"Malformed generated constraint at {resolved_constraints_path}:{line_no}: {line!r}"
+            ) from exc
 
     # Install the exact wheelhouse without dependency resolution. --reinstall makes
     # validation deterministic even if a container happens to be reused.
@@ -850,10 +884,12 @@ if command -v sha256sum >/dev/null 2>&1 && [ -f "$HERE/SHA256SUMS.contents" ]; t
 fi
 
 uv pip uninstall --python "$PYTHON_BIN" pillow-simd Pillow >/dev/null 2>&1 || true
+# OpenI deliberately uses only the hand-written ABI constraints.
+# constraints-openi.resolved.txt is packaged for diagnostics/reproducibility only;
+# it must never be able to block installation because of resolver/log-format drift.
 uv pip install --python "$PYTHON_BIN" \
   -r "$HERE/requirements-openi.txt" \
-  -c "$HERE/constraints-openi.txt" \
-  -c "$HERE/constraints-openi.resolved.txt"
+  -c "$HERE/constraints-openi.txt"
 uv pip install --python "$PYTHON_BIN" --no-deps --reinstall "$HERE"/wheelhouse/*.whl
 uv pip check --python "$PYTHON_BIN"
 
@@ -1028,7 +1064,7 @@ def publish_release(cache_key: str) -> dict[str, object]:
             json={
                 "tag_name": RELEASE_TAG,
                 "target_commitish": "main",
-                "name": "TRELLIS.2 OpenI A100/cu124/torch2.6/Python 3.11 wheelhouse",
+                "name": "v2 TRELLIS.2 OpenI A100/cu124/torch2.6/Python 3.11 wheelhouse",
                 "body": (
                     "Prebuilt TRELLIS.2 dependencies for Ubuntu 22.04, Python 3.11, "
                     "CUDA 12.4, PyTorch 2.6.0 and A100 sm_80. Built on Modal A100, "
