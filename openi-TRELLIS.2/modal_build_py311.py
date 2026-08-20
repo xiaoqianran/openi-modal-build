@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import modal
 
-APP_NAME = "v2-openi-trellis2-wheel-builder-py311"
+APP_NAME = "v3-openi-trellis2-wheel-builder-py311"
 GITHUB_REPO = "xiaoqianran/openi-modal-build"
-RELEASE_TAG = "v2-trellis2-cu124-torch2.6.0-py311-sm80"
+RELEASE_TAG = "v3-trellis2-cu124-torch2.6.0-py311-sm80"
 CACHE_VOLUME_NAME = "openi-trellis2-wheel-cache-py311"
 CACHE_SCHEMA = "v4-003-py311"
 UV_VERSION = "0.12.3"
 MODAL_GPU = "A100-40GB"
-RELEASE_ARCHIVE = "v2-trellis2-openi-cu124-torch260-py311-sm80.tar.gz"
+RELEASE_ARCHIVE = "v3-trellis2-openi-cu124-torch260-py311-sm80.tar.gz"
+RELEASE_CACHE_DIR = "release-v3"
 # The py310 private OpenI registry image ID is intentionally not reused here.
 # This value is a target ABI label for the manifest; the installer enforces Python 3.11 at runtime.
 OPENI_IMAGE_REFERENCE = (
@@ -24,6 +25,7 @@ TORCH_CUDA_VERSION = "12.4"
 CUDA_TOOLKIT_VERSION = "12.4.0"
 CUDA_ARCH = "8.0"
 FLASH_ATTN_VERSION = "2.7.3"
+ACCELERATE_VERSION = "1.7.0"
 
 # Pin every Git source. A fixed release tag must never silently rebuild against
 # a moving upstream branch.
@@ -50,7 +52,7 @@ SOURCE_SPECS = {
 # Direct runtime versions below are the exact versions observed in the final
 # successful Modal validation run. Pinning them prevents a future PyPI resolver
 # run from silently changing the OpenI environment under the same release tag.
-RUNTIME_REQUIREMENTS = """\
+BUILD_RUNTIME_REQUIREMENTS = """\
 imageio==2.37.4
 imageio-ffmpeg==0.6.0
 tqdm==4.70.0
@@ -76,6 +78,16 @@ scipy==1.15.3
 filelock==3.32.3
 triton==3.2.0
 """
+
+# Runtime-only compatibility pins are intentionally excluded from the CUDA wheel
+# build cache identity. They affect the final OpenI Python runtime, not compiled
+# extension ABI/artifacts, so adding/changing them must not force an expensive
+# rebuild of already validated CUDA wheels.
+RUNTIME_ONLY_REQUIREMENTS = f"""\
+accelerate=={ACCELERATE_VERSION}
+"""
+
+RUNTIME_REQUIREMENTS = BUILD_RUNTIME_REQUIREMENTS + RUNTIME_ONLY_REQUIREMENTS
 
 RUNTIME_CONSTRAINTS = """\
 torch==2.6.0
@@ -159,7 +171,7 @@ def _cache_identity() -> dict[str, object]:
         "cuda_arch": CUDA_ARCH,
         "flash_attn": FLASH_ATTN_VERSION,
         "sources": {name: spec[1] for name, spec in SOURCE_SPECS.items()},
-        "runtime_requirements": RUNTIME_REQUIREMENTS,
+        "runtime_requirements": BUILD_RUNTIME_REQUIREMENTS,
         "runtime_constraints": RUNTIME_CONSTRAINTS,
     }
 
@@ -429,7 +441,7 @@ def build_wheelhouse(force_rebuild: bool = False) -> dict[str, object]:
     # compiling. This also avoids any build backend attempting to replace torch.
     build_requirements = root / "requirements-build.txt"
     build_constraints = root / "constraints-build.txt"
-    build_requirements.write_text(RUNTIME_REQUIREMENTS, encoding="utf-8")
+    build_requirements.write_text(BUILD_RUNTIME_REQUIREMENTS, encoding="utf-8")
     build_constraints.write_text(RUNTIME_CONSTRAINTS, encoding="utf-8")
     run(["uv", "pip", "uninstall", "--python", sys.executable, "pillow-simd", "Pillow"], check=False)
     run(
@@ -734,6 +746,29 @@ def validate_and_package(cache_key: str) -> dict[str, object]:
     )
     run(["uv", "pip", "check", "--python", sys.executable])
 
+    # Verify every direct exact pin against installed distribution metadata. This is
+    # important for OpenI-like pre-populated environments: a successful resolver run
+    # is not enough if an unexpected preinstalled version survives.
+    run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from importlib.metadata import version; "
+                "from packaging.requirements import Requirement; "
+                "from pathlib import Path; "
+                "p=Path(__import__('sys').argv[1]); "
+                "reqs=[Requirement(x.strip()) for x in p.read_text().splitlines() "
+                "if x.strip() and not x.lstrip().startswith('#')]; "
+                "bad=[(r.name, str(r.specifier), version(r.name)) for r in reqs "
+                "if not r.specifier.contains(version(r.name), prereleases=True)]; "
+                "assert not bad, f'direct runtime pin mismatch: {bad}'; "
+                "print('direct runtime pins: OK')"
+            ),
+            str(requirements_path),
+        ]
+    )
+
     run(
         [
             sys.executable,
@@ -755,14 +790,18 @@ def validate_and_package(cache_key: str) -> dict[str, object]:
             sys.executable,
             "-c",
             (
-                "import cv2, easydict, einops, filelock, gradio, imageio, "
+                "import accelerate, cv2, easydict, einops, filelock, gradio, imageio, "
                 "imageio_ffmpeg, kornia, lpips, moderngl, ninja, numpy, pandas, "
                 "plyfile, scipy, tensorboard, timm, tqdm, transformers, trimesh, "
                 "triton, torchvision, zstandard; "
+                f"assert accelerate.__version__ == '{ACCELERATE_VERSION}', accelerate.__version__; "
+                "assert transformers.__version__ == '4.57.6', transformers.__version__; "
                 "from transformers import DINOv3ViTModel; "
                 "from PIL import Image, features; Image.init(); "
                 "assert features.check('jpg'); assert features.check('zlib'); "
-                "assert features.check('webp'); print('runtime dependencies: OK')"
+                "assert features.check('webp'); "
+                "print('runtime dependencies: OK, accelerate=', accelerate.__version__, "
+                "'transformers=', transformers.__version__)"
             ),
         ]
     )
@@ -854,8 +893,9 @@ def validate_and_package(cache_key: str) -> dict[str, object]:
 set -eu
 
 HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+PYTHON_BIN="$(command -v python)"
 
-python - <<'PY_CHECK'
+"$PYTHON_BIN" - <<'PY_CHECK'
 import sys, torch, torchvision, triton
 print("Python:", sys.version)
 print("Torch:", torch.__version__)
@@ -869,39 +909,74 @@ assert torchvision.__version__.split("+", 1)[0] == "{TORCHVISION_VERSION}", "Exp
 assert triton.__version__ == "3.2.0", "Expected Triton 3.2.0"
 PY_CHECK
 
-if ! command -v uv >/dev/null 2>&1; then
-  python -m pip install --no-deps "$HERE"/bootstrap/uv-*.whl
+# Always use the bundled uv wheel with the current Notebook Python. Do not trust
+# an arbitrary system uv version on OpenI, because resolver/log behavior can drift.
+"$PYTHON_BIN" -m pip install --no-deps --force-reinstall "$HERE"/bootstrap/uv-*.whl
+UV_BIN="$(dirname -- "$PYTHON_BIN")/uv"
+if [ ! -x "$UV_BIN" ]; then
+  echo "Bundled uv executable not found next to $PYTHON_BIN: $UV_BIN" >&2
+  exit 1
 fi
+UV_ACTUAL="$("$UV_BIN" --version)"
+case "$UV_ACTUAL" in
+  "uv {UV_VERSION}"*) ;;
+  *) echo "Expected uv {UV_VERSION}, got: $UV_ACTUAL" >&2; exit 1 ;;
+esac
 
 export UV_LINK_MODE=copy
 # Never compile on OpenI. A missing binary wheel must fail loudly instead of
 # consuming GPU job time building CUDA/C++ extensions again.
 export UV_NO_BUILD=1
-PYTHON_BIN="$(command -v python)"
 
 if command -v sha256sum >/dev/null 2>&1 && [ -f "$HERE/SHA256SUMS.contents" ]; then
   (cd "$HERE" && sha256sum -c SHA256SUMS.contents)
 fi
 
-uv pip uninstall --python "$PYTHON_BIN" pillow-simd Pillow >/dev/null 2>&1 || true
+"$UV_BIN" pip uninstall --python "$PYTHON_BIN" pillow-simd Pillow >/dev/null 2>&1 || true
 # OpenI deliberately uses only the hand-written ABI constraints.
 # constraints-openi.resolved.txt is packaged for diagnostics/reproducibility only;
 # it must never be able to block installation because of resolver/log-format drift.
-uv pip install --python "$PYTHON_BIN" \
+"$UV_BIN" pip install --python "$PYTHON_BIN" \
   -r "$HERE/requirements-openi.txt" \
   -c "$HERE/constraints-openi.txt"
-uv pip install --python "$PYTHON_BIN" --no-deps --reinstall "$HERE"/wheelhouse/*.whl
-uv pip check --python "$PYTHON_BIN"
+"$UV_BIN" pip install --python "$PYTHON_BIN" --no-deps --reinstall "$HERE"/wheelhouse/*.whl
+# Do NOT run a whole-environment `uv pip check` on OpenI: its /usr/local Python is
+# pre-populated with hundreds of unrelated packages, and an unrelated legacy conflict
+# must not block TRELLIS.2. The clean Modal validation already runs uv pip check; here
+# we verify every direct pin plus the actual TRELLIS/runtime imports below.
 
 mkdir -p "$HOME/.flex_gemm"
 cp "$HERE/flex_gemm_autotune_cache.json" "$HOME/.flex_gemm/autotune_cache.json"
 
-python - <<'PY_VERIFY'
-import torch, torchvision, triton
+"$PYTHON_BIN" - "$HERE/requirements-openi.txt" <<'PY_VERIFY'
+import sys
+from importlib.metadata import version as dist_version
+from packaging.requirements import Requirement
+
+with open(sys.argv[1], encoding="utf-8") as fh:
+    direct_requirements = [
+        Requirement(line.strip())
+        for line in fh
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+bad_pins = []
+for req in direct_requirements:
+    installed = dist_version(req.name)
+    if not req.specifier.contains(installed, prereleases=True):
+        bad_pins.append((req.name, str(req.specifier), installed))
+assert not bad_pins, f"Direct runtime pin mismatch: {{bad_pins}}"
+print("Direct runtime pins: OK")
+
+import accelerate, torch, torchvision, transformers, triton
 assert torch.__version__.split("+", 1)[0] == "{TORCH_VERSION}"
 assert torch.version.cuda == "{TORCH_CUDA_VERSION}"
 assert torchvision.__version__.split("+", 1)[0] == "{TORCHVISION_VERSION}"
 assert triton.__version__ == "3.2.0"
+assert accelerate.__version__ == "{ACCELERATE_VERSION}", accelerate.__version__
+assert transformers.__version__ == "4.57.6", transformers.__version__
+print("Accelerate:", accelerate.__version__)
+print("Transformers:", transformers.__version__)
 
 # torch must be imported before torch-linked private extension DSOs.
 import flash_attn, flash_attn_2_cuda
@@ -919,6 +994,15 @@ assert features.check("jpg") and features.check("zlib") and features.check("webp
 print("TRELLIS.2 prebuilt dependencies: OK")
 PY_VERIFY
 '''
+    # This is the exact regression guard for the OpenI failure that motivated v2/v3.
+    # The resolved snapshot may remain in the archive, but the installer must never
+    # pass it to uv as a constraints file.
+    forbidden_resolved_arg = '-c "$HERE/constraints-openi.resolved.txt"'
+    if forbidden_resolved_arg in installer:
+        raise RuntimeError(
+            "Regression: install_openi.sh must not consume constraints-openi.resolved.txt"
+        )
+
     installer_path = dist / "install_openi.sh"
     installer_path.write_text(installer, encoding="utf-8")
     installer_path.chmod(0o755)
@@ -953,6 +1037,9 @@ PY_VERIFY
             "uv_bootstrap_wheel": uv_bootstrap[0].name,
             "resolved_constraints_sha256": sha256_file(resolved_constraints_path),
             "source_builds_disabled": True,
+            "accelerate": ACCELERATE_VERSION,
+            # Packaging returns successfully only after the archived installer itself runs.
+            "packaged_installer_smoke": True,
         },
         "created_unix": int(time.time()),
     }
@@ -992,6 +1079,24 @@ PY_VERIFY
         tf.add(content_sums, arcname="SHA256SUMS.contents")
         tf.add(dist / "flex_gemm_autotune_cache.json", arcname="flex_gemm_autotune_cache.json")
 
+    # Final package-level gate: extract the exact tar.gz that will be published and
+    # execute its installer. This catches archive-layout, shell quoting, checksum,
+    # PATH/Python selection, uv invocation, and wheel-install regressions that the
+    # earlier in-process validation cannot detect.
+    package_smoke = root / "package-smoke"
+    shutil.rmtree(package_smoke, ignore_errors=True)
+    package_smoke.mkdir(parents=True)
+    with tarfile.open(archive, "r:gz") as tf:
+        tf.extractall(package_smoke)
+
+    smoke_installer = package_smoke / "install_openi.sh"
+    if not smoke_installer.is_file():
+        raise RuntimeError("Packaged install_openi.sh is missing after archive extraction")
+
+    print("\n===== VERIFY PACKAGED OPENI INSTALLER =====", flush=True)
+    run(["bash", str(smoke_installer)], cwd=package_smoke)
+    print("packaged install_openi.sh: OK", flush=True)
+
     sums = dist / "SHA256SUMS"
     sum_lines = [
         f"{sha256_file(archive)}  {archive.name}",
@@ -999,8 +1104,8 @@ PY_VERIFY
     ]
     sums.write_text("\n".join(sum_lines) + "\n", encoding="utf-8")
 
-    release_cache = cache_root / "release"
-    tmp_release = cache_root / "release.tmp"
+    release_cache = cache_root / RELEASE_CACHE_DIR
+    tmp_release = cache_root / f"{RELEASE_CACHE_DIR}.tmp"
     shutil.rmtree(tmp_release, ignore_errors=True)
     tmp_release.mkdir(parents=True)
     for path in (archive, manifest_path, sums):
@@ -1040,7 +1145,7 @@ def publish_release(cache_key: str) -> dict[str, object]:
         raise RuntimeError(f"Cache key mismatch: caller={cache_key}, expected={expected_key}")
 
     build_cache.reload()
-    release_dir = pathlib.Path("/cache/trellis2-py311") / cache_key / "release"
+    release_dir = pathlib.Path("/cache/trellis2-py311") / cache_key / RELEASE_CACHE_DIR
     archive = release_dir / RELEASE_ARCHIVE
     manifest = release_dir / "manifest.json"
     sums = release_dir / "SHA256SUMS"
